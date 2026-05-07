@@ -2,7 +2,7 @@ name: MLOps Pipeline
 
 on:
   push:
-    branches: [main, test-deploy]
+    branches: [main, bonus]
     paths:
       - 'data/**.dvc'
       - 'src/**.py'
@@ -89,11 +89,13 @@ jobs:
         env:
           CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
 
-      - name: Save metrics as artifact
+      - name: Upload metrics and report as artifact
         uses: actions/upload-artifact@v4
         with:
           name: metrics
-          path: outputs/metrics.json
+          path: |
+            outputs/metrics.json
+            outputs/report.txt
 
 
   # ---------------------------------------------------------------------------
@@ -106,15 +108,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: Check eval gate
-        # TODO 6: Dung lai neu accuracy < 0.70.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Authenticate to AWS
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=ap-southeast-1" >> $GITHUB_ENV
+
+      - name: Check eval gate + rollback guard
+        # Bonus 4: chi deploy khi accuracy moi >= accuracy cu (neu co).
         run: |
           python - <<'EOF'
+          import boto3, json, os
+
           acc = float("${{ needs.train.outputs.accuracy }}")
           if acc < 0.70:
               raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
+
+          # Bonus 4: compare with previous model accuracy on S3
+          bucket = os.environ.get("CLOUD_BUCKET", "")
+          if bucket:
+              try:
+                  s3 = boto3.client("s3")
+                  obj = s3.get_object(Bucket=bucket, Key="models/latest/metrics.json")
+                  prev = json.loads(obj["Body"].read())
+                  prev_acc = float(prev.get("accuracy", 0))
+                  if acc < prev_acc:
+                      raise SystemExit(f"ROLLBACK: new accuracy {acc:.4f} < previous {prev_acc:.4f}. Huy deploy.")
+                  print(f"Rollback check passed: {acc:.4f} >= previous {prev_acc:.4f}")
+              except s3.exceptions.NoSuchKey:
+                  print("No previous metrics found, skipping rollback check.")
+              except Exception as e:
+                  print(f"Rollback check skipped: {e}")
+
           print(f"PASSED: accuracy {acc:.4f} >= 0.70. Dang trien khai model.")
           EOF
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
 
 
   # ---------------------------------------------------------------------------
@@ -123,9 +159,42 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
-    needs: eval
+    needs: [eval, train]
     runs-on: ubuntu-latest
     steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Download metrics artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics
+          path: outputs/
+
+      - name: Authenticate to AWS
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=ap-southeast-1" >> $GITHUB_ENV
+
+      - name: Save metrics to S3 for future rollback check
+        run: |
+          python - <<'EOF'
+          import boto3, os
+          bucket = os.environ["CLOUD_BUCKET"]
+          s3 = boto3.client("s3")
+          s3.upload_file("outputs/metrics.json", bucket, "models/latest/metrics.json")
+          print(f"Metrics saved to s3://{bucket}/models/latest/metrics.json")
+          EOF
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
 
       - name: SSH deploy to VM
         uses: appleboy/ssh-action@v1.0.3
